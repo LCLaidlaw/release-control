@@ -156,11 +156,17 @@ class Main(unittest.TestCase):
             self.assertEqual(self.run_main({"INPUT_DIGEST": DIGEST, "INPUT_MINUTES": "30"}), 1)
 
     def test_unpinned_or_mismatched_configuration_refused_before_any_network(self):
-        env = dict(good_cfg(), INPUT_DIGEST=DIGEST, INPUT_MINUTES="30")
-        for pinned in ["", "c" * 64]:
+        # The OIDC environment is present, so only the configuration check can refuse.
+        env = dict(good_cfg(), INPUT_DIGEST=DIGEST, INPUT_MINUTES="30",
+                   ACTIONS_ID_TOKEN_REQUEST_URL="https://example/token",
+                   ACTIONS_ID_TOKEN_REQUEST_TOKEN="t")
+        for pinned, reason in [("", "digest is not pinned"), ("c" * 64, "does not match")]:
             with mock.patch.object(ow, "CONFIG_SHA256", pinned), \
-                    mock.patch.object(ow, "_request", side_effect=AssertionError("network")):
+                    mock.patch.object(ow, "_request", side_effect=AssertionError("network")), \
+                    mock.patch("sys.stderr") as err:
                 self.assertEqual(self.run_main(env), 1)
+            written = "".join(str(c.args[0]) for c in err.write.call_args_list)
+            self.assertIn("refused: configuration " + reason, written)
 
     def test_opens_window_before_recording_approval_and_pins_requests(self):
         calls = []
