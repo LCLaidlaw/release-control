@@ -89,11 +89,14 @@ class Main(unittest.TestCase):
         with mock.patch.object(ow, "_request", side_effect=AssertionError("network")):
             self.assertEqual(self.run_main({"INPUT_DIGEST": DIGEST, "INPUT_MINUTES": "30"}), 1)
 
-    def test_records_approval_before_opening_window(self):
+    def test_opens_window_before_recording_approval_and_pins_requests(self):
         calls = []
+
+        seen = {}
 
         def fake(step, method, url, token=None, body=None, content_type="application/json", data=None):
             calls.append(step)
+            seen[step] = {"url": url, "body": body, "data": data}
             if step == "oidc":
                 return {"value": "jwt"}
             if step == "sts":
@@ -110,7 +113,13 @@ class Main(unittest.TestCase):
                     "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"})
         with mock.patch.object(ow, "_request", side_effect=fake):
             self.assertEqual(self.run_main(env), 0)
-        self.assertEqual(calls, ["oidc", "sts", "impersonate", "approval record", "read policy", "write policy"])
+        self.assertEqual(calls, ["oidc", "sts", "impersonate", "read policy", "write policy", "approval record"])
+        # The gate token is short-lived.
+        self.assertEqual(seen["impersonate"]["body"]["lifetime"], "300s")
+        # The approval record is create-only and names the digest.
+        url = seen["approval record"]["url"]
+        self.assertIn("ifGenerationMatch=0", url)
+        self.assertIn("approvals%2F" + DIGEST + ".json", url)
 
     def test_refusal_message_never_contains_configuration(self):
         env = {k: "SECRET-LOOKING-" + k for k in ow.CONFIG_KEYS}
@@ -122,6 +131,18 @@ class Main(unittest.TestCase):
             self.assertEqual(self.run_main(env), 1)
         written = "".join(str(c.args[0]) for c in err.write.call_args_list)
         self.assertNotIn("SECRET-LOOKING", written)
+
+
+class HttpErrors(unittest.TestCase):
+    def test_http_error_body_is_never_in_the_refusal(self):
+        import io
+        import urllib.error
+        err = urllib.error.HTTPError("https://example/x", 403, "Forbidden", {},
+                                     io.BytesIO(b"RESPONSE-BODY-WITH-resource-names"))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(ow.Refused) as ctx:
+                ow._request("read policy", "POST", "https://example/x", token="t", body={})
+        self.assertEqual(str(ctx.exception), "read policy failed with HTTP 403")
 
 
 if __name__ == "__main__":

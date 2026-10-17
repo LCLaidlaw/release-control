@@ -5,11 +5,16 @@ Runs only inside the approved job of .github/workflows/open-window.yml. It uses 
 job's GitHub OIDC token, exchanges it through Workload Identity Federation for a
 short-lived token as the gate service account, and then:
 
-  1. records the approved plan digest as an approval object (create-only: an
-     existing object is never overwritten);
-  2. adds one roles/iam.workloadIdentityUser binding for the configured member on
+  1. adds one roles/iam.workloadIdentityUser binding for the configured member on
      the target service account, conditioned on request.time < expiry, and drops
-     any earlier window bindings for that member.
+     any earlier window bindings for that member;
+  2. then records the approved plan digest as an approval object (create-only: an
+     existing object is never overwritten, so each digest is approved at most once).
+
+The window comes first so that a failed or re-run attempt (for example an etag
+conflict) can be retried for the same digest: the record only exists once the
+window was opened. A window without a record is harmless, because the consumer
+refuses to apply without a matching unexpired record.
 
 Standard library only. Configuration comes from environment variables and is
 never printed; HTTP errors report only the step and status code, never a body.
@@ -169,8 +174,8 @@ def main():
         expires = expiry(datetime.datetime.now(datetime.timezone.utc), minutes)
         oidc = github_oidc_token("//iam.googleapis.com/" + cfg["WIF_PROVIDER"])
         token = gate_token(federated_token(cfg["WIF_PROVIDER"], oidc), cfg["GATE_SA"])
-        write_approval(token, cfg["APPROVAL_BUCKET"], digest, expires)
         open_window(token, cfg["TARGET_SA"], cfg["MEMBER"], digest, expires)
+        write_approval(token, cfg["APPROVAL_BUCKET"], digest, expires)
         print(f"window open until {expires} for digest {digest}")
         return 0
     except Refused as err:
