@@ -9,6 +9,14 @@ import open_window as ow  # noqa: E402
 
 DIGEST = "a" * 64
 MEMBER = "principalSet://example/attribute.x/y"
+POOL_MEMBER = ("principalSet://iam.googleapis.com/projects/123/locations/global/"
+               "workloadIdentityPools/pool-a/attribute.job_workflow_ref/owner/repo/wf.yml@" + "b" * 40)
+
+
+def good_cfg():
+    cfg = {k: "cfg-" + k for k in ow.CONFIG_KEYS}
+    cfg["MEMBER"] = POOL_MEMBER
+    return cfg
 
 
 class Validate(unittest.TestCase):
@@ -25,6 +33,64 @@ class Validate(unittest.TestCase):
         for bad in ["4", "61", "0", "-5", "5.0", " 30", "30 ", "30\n", "100", "", "1e1", None]:
             with self.assertRaises(ow.Refused):
                 ow.validate(DIGEST, bad)
+
+
+class ConfigPin(unittest.TestCase):
+    def test_digest_is_sha256_of_the_ordered_values(self):
+        import hashlib
+        import json
+        cfg = good_cfg()
+        expected = hashlib.sha256(json.dumps([cfg[k] for k in ow.CONFIG_KEYS],
+                                             separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(ow.config_digest(cfg), expected)
+
+    def test_matching_configuration_passes(self):
+        cfg = good_cfg()
+        ow.check_config(cfg, ow.config_digest(cfg))
+
+    def test_any_changed_value_is_refused(self):
+        cfg = good_cfg()
+        pinned = ow.config_digest(cfg)
+        for key in ow.CONFIG_KEYS:
+            changed = dict(cfg)
+            changed[key] = cfg[key] + "x"
+            with self.assertRaises(ow.Refused) as ctx:
+                ow.check_config(changed, pinned)
+            self.assertNotIn(changed[key], str(ctx.exception))
+
+    def test_swapped_values_are_refused(self):
+        cfg = good_cfg()
+        pinned = ow.config_digest(cfg)
+        swapped = dict(cfg, GATE_SA=cfg["TARGET_SA"], TARGET_SA=cfg["GATE_SA"])
+        with self.assertRaises(ow.Refused):
+            ow.check_config(swapped, pinned)
+
+    def test_unpinned_digest_is_refused(self):
+        cfg = good_cfg()
+        for pinned in ["", None, "A" * 64, "a" * 63]:
+            with self.assertRaises(ow.Refused):
+                ow.check_config(cfg, pinned)
+
+    def test_shipped_constant_is_empty_or_a_digest(self):
+        self.assertTrue(ow.CONFIG_SHA256 == "" or ow.DIGEST_RE.fullmatch(ow.CONFIG_SHA256))
+
+    def test_member_must_be_a_pool_principal(self):
+        for bad in ["allUsers", "allAuthenticatedUsers", "user:someone@example.com",
+                    "serviceAccount:x@example", "group:g@example.com", MEMBER,
+                    POOL_MEMBER + "\n", " " + POOL_MEMBER,
+                    "principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/"]:
+            cfg = dict(good_cfg(), MEMBER=bad)
+            # Even a digest that matches the bad member does not let it through.
+            with self.assertRaises(ow.Refused):
+                ow.check_config(cfg, ow.config_digest(cfg))
+        single = POOL_MEMBER.replace("principalSet://", "principal://")
+        cfg = dict(good_cfg(), MEMBER=single)
+        ow.check_config(cfg, ow.config_digest(cfg))
+
+    def test_missing_value_is_refused(self):
+        cfg = dict(good_cfg(), APPROVAL_BUCKET="")
+        with self.assertRaises(ow.Refused):
+            ow.check_config(cfg, ow.config_digest(cfg))
 
 
 class Expiry(unittest.TestCase):
@@ -89,6 +155,13 @@ class Main(unittest.TestCase):
         with mock.patch.object(ow, "_request", side_effect=AssertionError("network")):
             self.assertEqual(self.run_main({"INPUT_DIGEST": DIGEST, "INPUT_MINUTES": "30"}), 1)
 
+    def test_unpinned_or_mismatched_configuration_refused_before_any_network(self):
+        env = dict(good_cfg(), INPUT_DIGEST=DIGEST, INPUT_MINUTES="30")
+        for pinned in ["", "c" * 64]:
+            with mock.patch.object(ow, "CONFIG_SHA256", pinned), \
+                    mock.patch.object(ow, "_request", side_effect=AssertionError("network")):
+                self.assertEqual(self.run_main(env), 1)
+
     def test_opens_window_before_recording_approval_and_pins_requests(self):
         calls = []
 
@@ -107,11 +180,12 @@ class Main(unittest.TestCase):
                 return {"etag": "e", "bindings": []}
             return {}
 
-        env = {k: "cfg" for k in ow.CONFIG_KEYS}
+        env = good_cfg()
         env.update({"INPUT_DIGEST": DIGEST, "INPUT_MINUTES": "30",
                     "ACTIONS_ID_TOKEN_REQUEST_URL": "https://example/token",
                     "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"})
-        with mock.patch.object(ow, "_request", side_effect=fake):
+        with mock.patch.object(ow, "CONFIG_SHA256", ow.config_digest(good_cfg())), \
+                mock.patch.object(ow, "_request", side_effect=fake):
             self.assertEqual(self.run_main(env), 0)
         self.assertEqual(calls, ["oidc", "sts", "impersonate", "read policy", "write policy", "approval record"])
         # The gate token is short-lived.
@@ -123,14 +197,18 @@ class Main(unittest.TestCase):
 
     def test_refusal_message_never_contains_configuration(self):
         env = {k: "SECRET-LOOKING-" + k for k in ow.CONFIG_KEYS}
+        env["MEMBER"] = POOL_MEMBER.replace("pool-a", "secret-looking-pool")
         env.update({"INPUT_DIGEST": DIGEST, "INPUT_MINUTES": "30",
                     "ACTIONS_ID_TOKEN_REQUEST_URL": "https://example/token",
                     "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"})
-        with mock.patch.object(ow, "_request", side_effect=ow.Refused("sts failed with HTTP 403")), \
+        pinned = ow.config_digest(env)
+        with mock.patch.object(ow, "CONFIG_SHA256", pinned), \
+                mock.patch.object(ow, "_request", side_effect=ow.Refused("sts failed with HTTP 403")), \
                 mock.patch("sys.stderr") as err:
             self.assertEqual(self.run_main(env), 1)
         written = "".join(str(c.args[0]) for c in err.write.call_args_list)
         self.assertNotIn("SECRET-LOOKING", written)
+        self.assertNotIn("secret-looking", written)
 
 
 class HttpErrors(unittest.TestCase):
@@ -139,10 +217,17 @@ class HttpErrors(unittest.TestCase):
         import urllib.error
         err = urllib.error.HTTPError("https://example/x", 403, "Forbidden", {},
                                      io.BytesIO(b"RESPONSE-BODY-WITH-resource-names"))
-        with mock.patch("urllib.request.urlopen", side_effect=err):
+        with mock.patch.object(ow._OPENER, "open", side_effect=err):
             with self.assertRaises(ow.Refused) as ctx:
                 ow._request("read policy", "POST", "https://example/x", token="t", body={})
         self.assertEqual(str(ctx.exception), "read policy failed with HTTP 403")
+
+    def test_redirects_are_never_followed(self):
+        import urllib.request
+        handler = ow._NoRedirect()
+        req = urllib.request.Request("https://example/x", headers={"Authorization": "Bearer t"})
+        self.assertIsNone(handler.redirect_request(req, None, 302, "Found", {}, "https://elsewhere/y"))
+        self.assertTrue(any(isinstance(h, ow._NoRedirect) for h in ow._OPENER.handlers))
 
 
 if __name__ == "__main__":

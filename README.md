@@ -37,6 +37,14 @@ The system that holds the plan is expected to apply only when:
 
 Configuration lives in the protected environment's **secrets**, not variables: `WIF_PROVIDER`, `GATE_SA`, `TARGET_SA`, `MEMBER` and `APPROVAL_BUCKET`. GitHub therefore masks them everywhere, including step headers, and releases them only to the approved job. Logs show only the digest and the expiry time. Errors show only the failing step and its HTTP status, never a response body.
 
+Secrets protect visibility, not integrity: a repository admin could replace one. So the values are also **bound to the reviewed commit**:
+- `CONFIG_SHA256` in `scripts/open_window.py` is the sha256 of the five values, as the compact JSON array `["<WIF_PROVIDER>","<GATE_SA>","<TARGET_SA>","<MEMBER>","<APPROVAL_BUCKET>"]` (see `config_digest`).
+- Before any network call, the script refuses if that constant is empty or does not match the environment's values.
+- `MEMBER` must be a workload identity pool `principal://` or `principalSet://` identifier. A user, group, service account, `allUsers` or `allAuthenticatedUsers` is refused.
+- Changing any value therefore needs a reviewed commit and a new trust pin. Only the digest is public.
+
+HTTP redirects are never followed, so a bearer token is only ever sent to the URL the script chose.
+
 The cloud side is expected to trust only this repository, `main`, the `staging-infra` environment, `workflow_dispatch`, this workflow file and a pinned workflow commit. Any change to this repository therefore needs the trust to be re-pinned before it can run with privilege.
 
 `checks.yml` runs the unit tests in `tests/` with no credentials.

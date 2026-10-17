@@ -18,9 +18,17 @@ refuses to apply without a matching unexpired record.
 
 Standard library only. Configuration comes from environment variables and is
 never printed; HTTP errors report only the step and status code, never a body.
+
+The configuration is bound to the reviewed commit: CONFIG_SHA256 below is the
+sha256 of the five values (see config_digest), and the script refuses before any
+network call when the environment's values do not match it. Replacing a value in
+the environment alone therefore cannot redirect an approved run; it needs a
+reviewed commit and a new trust pin. Only the digest is public.
 """
 
 import datetime
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,6 +43,11 @@ MIN_MINUTES = 5
 MAX_MINUTES = 60
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 CONFIG_KEYS = ("WIF_PROVIDER", "GATE_SA", "TARGET_SA", "MEMBER", "APPROVAL_BUCKET")
+# sha256 of the reviewed configuration (config_digest). Empty means not yet pinned,
+# and the script refuses to run. Set it in a reviewed commit, then re-pin the trust.
+CONFIG_SHA256 = ""
+MEMBER_RE = re.compile(r"principal(Set)?://iam\.googleapis\.com/projects/[0-9]+/locations/global/"
+                       r"workloadIdentityPools/[a-z0-9-]+/[!-~]+")
 
 
 class Refused(Exception):
@@ -50,6 +63,24 @@ def validate(digest, minutes):
     if not MIN_MINUTES <= value <= MAX_MINUTES:
         raise Refused(f"minutes must be an integer from {MIN_MINUTES} to {MAX_MINUTES}")
     return digest, value
+
+
+def config_digest(cfg):
+    """sha256 over the five values in CONFIG_KEYS order, as a compact JSON array."""
+    values = [cfg[k] for k in CONFIG_KEYS]
+    return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
+
+
+def check_config(cfg, pinned):
+    missing = [k for k in CONFIG_KEYS if not cfg.get(k)]
+    if missing:
+        raise Refused("missing configuration: " + ", ".join(missing))
+    if not MEMBER_RE.fullmatch(cfg["MEMBER"]):
+        raise Refused("MEMBER must be a workload identity pool principal or principal set")
+    if not (isinstance(pinned, str) and DIGEST_RE.fullmatch(pinned)):
+        raise Refused("configuration digest is not pinned in this commit")
+    if not hmac.compare_digest(config_digest(cfg), pinned):
+        raise Refused("configuration does not match the digest pinned in this commit")
 
 
 def expiry(now, minutes):
@@ -86,6 +117,16 @@ def with_window(policy, member, digest, expires):
     return out
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect, so a bearer token is only sent to the URL we chose."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _request(step, method, url, token=None, body=None, content_type="application/json", data=None):
     headers = {}
     if token:
@@ -96,7 +137,7 @@ def _request(step, method, url, token=None, body=None, content_type="application
         headers["Content-Type"] = content_type
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _OPENER.open(req, timeout=30) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as err:
         raise Refused(f"{step} failed with HTTP {err.code}") from None
@@ -168,9 +209,7 @@ def main():
             print(f"inputs valid: digest {digest}, {minutes} minutes")
             return 0
         cfg = {k: os.environ.get(k, "") for k in CONFIG_KEYS}
-        missing = [k for k, v in cfg.items() if not v]
-        if missing:
-            raise Refused("missing configuration: " + ", ".join(missing))
+        check_config(cfg, CONFIG_SHA256)
         expires = expiry(datetime.datetime.now(datetime.timezone.utc), minutes)
         oidc = github_oidc_token("//iam.googleapis.com/" + cfg["WIF_PROVIDER"])
         token = gate_token(federated_token(cfg["WIF_PROVIDER"], oidc), cfg["GATE_SA"])
