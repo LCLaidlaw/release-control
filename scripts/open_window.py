@@ -45,7 +45,7 @@ DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 CONFIG_KEYS = ("WIF_PROVIDER", "GATE_SA", "TARGET_SA", "MEMBER", "APPROVAL_BUCKET")
 # sha256 of the reviewed configuration (config_digest). Empty means not yet pinned,
 # and the script refuses to run. Set it in a reviewed commit, then re-pin the trust.
-CONFIG_SHA256 = ""
+CONFIG_SHA256 = "a3b611ec11d7932cb9ed89e9c578fe7e892ab4f0ca621b642024daabe60c106a"
 MEMBER_RE = re.compile(r"principal(Set)?://iam\.googleapis\.com/projects/[0-9]+/locations/global/"
                        r"workloadIdentityPools/[a-z0-9-]+/[!-~]+")
 
