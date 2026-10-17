@@ -1,0 +1,76 @@
+name: Open approval window
+
+# Manual only. The first job checks the inputs without any credentials. The second
+# job waits for the protected environment's required reviewer; only after approval
+# does it receive an OIDC token, which it exchanges for a short-lived token used to
+# open a time-bounded window and then record the approved digest. Nothing else runs here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "sha256 of the approved plan (64 lowercase hex characters)"
+        required: true
+        type: string
+      minutes:
+        description: "window length in minutes (5 to 60)"
+        required: true
+        default: "30"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: open-window
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate inputs (no credentials)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out this commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate inputs
+        env:
+          VALIDATE_ONLY: "1"
+          INPUT_DIGEST: ${{ inputs.digest }}
+          INPUT_MINUTES: ${{ inputs.minutes }}
+        run: python3 scripts/open_window.py
+
+  open-window:
+    name: Open window (after approval)
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: staging-infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out this commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # Configuration is held as environment secrets of the protected environment, so
+      # GitHub masks it everywhere, including the step's env header, and releases it
+      # only to this approved job. Never move these to plain variables.
+      - name: Open window and record approval
+        env:
+          INPUT_DIGEST: ${{ inputs.digest }}
+          INPUT_MINUTES: ${{ inputs.minutes }}
+          WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
+          GATE_SA: ${{ secrets.GATE_SA }}
+          TARGET_SA: ${{ secrets.TARGET_SA }}
+          MEMBER: ${{ secrets.MEMBER }}
+          APPROVAL_BUCKET: ${{ secrets.APPROVAL_BUCKET }}
+        run: python3 scripts/open_window.py
